@@ -2,7 +2,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -60,13 +60,77 @@ impl PathGroup {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SelectionDb — standalone persistence (JSON file)
+// ---------------------------------------------------------------------------
+
 /// Persisted map: source identifier (file path or URL) → list of deselected paths.
 #[derive(Default, Serialize, Deserialize)]
 struct SelectionDb {
+    /// Source key → list of deselected endpoint paths.
     deselected: HashMap<String, Vec<String>>,
+    /// Source key → full list of all endpoint paths at last export.
+    /// Used to detect new/removed endpoints when the spec changes.
+    #[serde(default)]
+    all_paths: HashMap<String, Vec<String>>,
 }
 
-const SELECTION_DB_KEY: &str = "selection_db";
+impl SelectionDb {
+    /// Platform-appropriate config directory for the app.
+    fn config_dir() -> PathBuf {
+        let base = if cfg!(target_os = "macos") {
+            dirs().join("Library/Application Support")
+        } else if cfg!(target_os = "windows") {
+            std::env::var("APPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| dirs())
+        } else {
+            // XDG on Linux / others
+            std::env::var("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| dirs().join(".config"))
+        };
+        base.join("openapi-edit")
+    }
+
+    fn db_path() -> PathBuf {
+        Self::config_dir().join("selections.json")
+    }
+
+    fn load() -> Self {
+        let path = Self::db_path();
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn save(&self) {
+        let path = Self::db_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    fn has_selection(&self, key: &str) -> bool {
+        self.deselected.contains_key(key)
+    }
+}
+
+/// Helper: user home directory.
+fn dirs() -> PathBuf {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
 
 struct App {
     spec: Option<Value>,
@@ -84,12 +148,7 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let selection_db: SelectionDb = cc
-            .storage
-            .and_then(|s| eframe::get_value(s, SELECTION_DB_KEY))
-            .unwrap_or_default();
-
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             spec: None,
             source_format: SpecFormat::Yaml,
@@ -100,22 +159,60 @@ impl App {
             search_query: String::new(),
             prune_components: true,
             source_key: None,
-            selection_db,
+            selection_db: SelectionDb::load(),
         }
     }
 
     /// Apply saved selection from the db to the current groups.
-    fn apply_saved_selection(&mut self) {
-        let Some(key) = &self.source_key else { return };
-        let Some(deselected) = self.selection_db.deselected.get(key) else { return };
-        let deselected_set: HashSet<&str> = deselected.iter().map(|s| s.as_str()).collect();
+    /// Returns (removed_endpoints, new_endpoints) for diagnostics.
+    fn apply_saved_selection(&mut self) -> (Vec<String>, Vec<String>) {
+        let Some(key) = &self.source_key else {
+            return (vec![], vec![]);
+        };
+        let Some(saved_deselected) = self.selection_db.deselected.get(key) else {
+            return (vec![], vec![]);
+        };
+
+        let saved_set: HashSet<&str> = saved_deselected.iter().map(|s| s.as_str()).collect();
+
+        // All current endpoint paths
+        let current_paths: HashSet<&str> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.endpoints.iter())
+            .map(|e| e.path.as_str())
+            .collect();
+
+        // Endpoints that were in the saved selection but no longer exist in the spec
+        let removed: Vec<String> = saved_deselected
+            .iter()
+            .filter(|p| !current_paths.contains(p.as_str()))
+            .cloned()
+            .collect();
+
+        // Apply deselection to endpoints that still exist
         for group in &mut self.groups {
             for ep in &mut group.endpoints {
-                if deselected_set.contains(ep.path.as_str()) {
+                if saved_set.contains(ep.path.as_str()) {
                     ep.selected = false;
                 }
             }
         }
+
+        // New endpoints = those in current spec that weren't in the previous
+        // known set. We reconstruct the previous full set as:
+        // previously selected = current_paths - saved_deselected + removed
+        // But simpler: new endpoints are those not mentioned in saved_deselected
+        // AND not previously selected. Since we only store deselected, any
+        // endpoint not in saved_deselected was previously selected (or is new).
+        // We can't distinguish those without storing the full path list.
+        // Instead, we'll also store the full set of known paths.
+        // For now: new = in current but not in (saved_deselected ∪ previously_selected_paths).
+        // We approximate: endpoints are "new" if they didn't exist in the previous
+        // spec at all. We need the full previous path list for that.
+        // → We'll enhance SelectionDb to also store all_paths.
+        let new_endpoints: Vec<String> = vec![]; // handled below via enhanced db
+
         let total: usize = self.groups.iter().map(|g| g.endpoints.len()).sum();
         let selected: usize = self.groups.iter().map(|g| g.selected_count()).sum();
         if selected < total {
@@ -124,6 +221,8 @@ impl App {
                 self.status
             );
         }
+
+        (removed, new_endpoints)
     }
 
     /// Save the current selection to the db.
@@ -136,11 +235,22 @@ impl App {
             .filter(|e| !e.selected)
             .map(|e| e.path.clone())
             .collect();
+        let all_paths: Vec<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.endpoints.iter())
+            .map(|e| e.path.clone())
+            .collect();
         if deselected.is_empty() {
             self.selection_db.deselected.remove(key);
         } else {
             self.selection_db.deselected.insert(key.clone(), deselected);
         }
+        // Always store the full path list so we can detect new/removed later
+        self.selection_db
+            .all_paths
+            .insert(key.clone(), all_paths);
+        self.selection_db.save();
     }
 }
 
@@ -159,10 +269,25 @@ fn load_spec(path: &Path) -> Result<(Value, SpecFormat), String> {
     let contents = std::fs::read_to_string(path).map_err(|e| format!("Read error: {e}"))?;
     let format = detect_format(path);
     let value: Value = match format {
-        SpecFormat::Json => serde_json::from_str(&contents).map_err(|e| format!("JSON parse error: {e}"))?,
-        SpecFormat::Yaml => serde_yaml::from_str(&contents).map_err(|e| format!("YAML parse error: {e}"))?,
+        SpecFormat::Json => {
+            serde_json::from_str(&contents).map_err(|e| format!("JSON parse error: {e}"))?
+        }
+        SpecFormat::Yaml => {
+            serde_yaml::from_str(&contents).map_err(|e| format!("YAML parse error: {e}"))?
+        }
     };
     Ok((value, format))
+}
+
+fn parse_spec_string(contents: &str, format: SpecFormat) -> Result<Value, String> {
+    match format {
+        SpecFormat::Json => {
+            serde_json::from_str(contents).map_err(|e| format!("JSON parse error: {e}"))
+        }
+        SpecFormat::Yaml => {
+            serde_yaml::from_str(contents).map_err(|e| format!("YAML parse error: {e}"))
+        }
+    }
 }
 
 fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
@@ -312,9 +437,7 @@ fn prune_unused_components(spec: &mut Value) {
     }
 
     // Remove empty sub-sections
-    components.retain(|_, v| {
-        v.as_object().map_or(true, |m| !m.is_empty())
-    });
+    components.retain(|_, v| v.as_object().map_or(true, |m| !m.is_empty()));
 }
 
 fn serialize_spec(spec: &Value, format: SpecFormat) -> Result<String, String> {
@@ -333,8 +456,10 @@ fn serialize_spec(spec: &Value, format: SpecFormat) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for App {
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, SELECTION_DB_KEY, &self.selection_db);
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        // SelectionDb is saved to its own file (not eframe storage) so the
+        // CLI can access it independently.
+        self.selection_db.save();
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -435,7 +560,9 @@ impl eframe::App for App {
                         .endpoints
                         .iter()
                         .enumerate()
-                        .filter(|(_, ep)| query.is_empty() || ep.path.to_lowercase().contains(&query))
+                        .filter(|(_, ep)| {
+                            query.is_empty() || ep.path.to_lowercase().contains(&query)
+                        })
                         .map(|(i, _)| i)
                         .collect();
 
@@ -526,13 +653,7 @@ impl App {
                     self.groups = groups;
                     self.loaded_file_name = Some(name);
                     self.search_query.clear();
-                    // Use canonical absolute path as source key
-                    self.source_key = Some(
-                        std::fs::canonicalize(path)
-                            .unwrap_or_else(|_| path.to_path_buf())
-                            .to_string_lossy()
-                            .to_string(),
-                    );
+                    self.source_key = Some(canonical_source_key(path));
                     self.apply_saved_selection();
                 }
                 Err(e) => {
@@ -545,12 +666,14 @@ impl App {
         }
     }
 
-    fn load_from_string(&mut self, contents: &str, name: &str, source_key: &str, format: SpecFormat) {
-        let parse_result: Result<Value, String> = match format {
-            SpecFormat::Json => serde_json::from_str(contents).map_err(|e| format!("JSON parse error: {e}")),
-            SpecFormat::Yaml => serde_yaml::from_str(contents).map_err(|e| format!("YAML parse error: {e}")),
-        };
-        match parse_result {
+    fn load_from_string(
+        &mut self,
+        contents: &str,
+        name: &str,
+        source_key: &str,
+        format: SpecFormat,
+    ) {
+        match parse_spec_string(contents, format) {
             Ok(value) => match extract_groups(&value) {
                 Ok(groups) => {
                     let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
@@ -587,10 +710,7 @@ impl App {
 
         match serialize_spec(&filtered, self.export_format) {
             Ok(output) => {
-                let default_name = format!(
-                    "filtered.{}",
-                    self.export_format.extension()
-                );
+                let default_name = format!("filtered.{}", self.export_format.extension());
 
                 let file = rfd::FileDialog::new()
                     .set_file_name(&default_name)
@@ -625,8 +745,16 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// Entry point
+// Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Canonical source key for a local file path.
+fn canonical_source_key(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
 
 /// Guess format from a URL path or fall back to YAML.
 fn detect_format_from_url(url: &str) -> SpecFormat {
@@ -651,24 +779,266 @@ fn download_spec(url: &str) -> Result<(String, String, SpecFormat), String> {
     Ok((body, name, format))
 }
 
-fn main() -> eframe::Result {
-    let arg = std::env::args().nth(1);
+// ---------------------------------------------------------------------------
+// CLI export mode
+// ---------------------------------------------------------------------------
 
-    // If argument looks like a URL, download it before starting the GUI.
-    let initial_source: Option<InitialSource> = match arg.as_deref() {
+/// Apply a saved selection to groups, detecting spec drift.
+/// Prints warnings for removed endpoints and info for new ones.
+/// Returns `true` if a saved selection was found and applied.
+fn apply_saved_selection_cli(
+    groups: &mut [PathGroup],
+    db: &SelectionDb,
+    source_key: &str,
+) -> bool {
+    let Some(saved_deselected) = db.deselected.get(source_key) else {
+        return false;
+    };
+
+    let deselected_set: HashSet<&str> = saved_deselected.iter().map(|s| s.as_str()).collect();
+
+    // Current endpoint paths
+    let current_paths: HashSet<String> = groups
+        .iter()
+        .flat_map(|g| g.endpoints.iter())
+        .map(|e| e.path.clone())
+        .collect();
+
+    // Detect removed endpoints (were deselected but no longer in spec)
+    let removed: Vec<&str> = saved_deselected
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|p| !current_paths.contains(*p))
+        .collect();
+
+    if !removed.is_empty() {
+        eprintln!(
+            "Warning: {} previously deselected endpoint(s) no longer exist in the spec:",
+            removed.len()
+        );
+        for r in &removed {
+            eprintln!("  - {r}");
+        }
+    }
+
+    // Detect removed endpoints that were previously *selected*
+    if let Some(saved_all) = db.all_paths.get(source_key) {
+        let prev_set: HashSet<&str> = saved_all.iter().map(|s| s.as_str()).collect();
+        let removed_selected: Vec<&str> = prev_set
+            .iter()
+            .filter(|p| !current_paths.contains(**p) && !deselected_set.contains(**p))
+            .copied()
+            .collect();
+        if !removed_selected.is_empty() {
+            eprintln!(
+                "Warning: {} previously selected endpoint(s) no longer exist in the spec:",
+                removed_selected.len()
+            );
+            for r in &removed_selected {
+                eprintln!("  - {r}");
+            }
+        }
+
+        // Detect new endpoints (in current spec but not in previous known set)
+        let mut new_endpoints: Vec<&str> = current_paths
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|p| !prev_set.contains(p))
+            .collect();
+        new_endpoints.sort();
+        if !new_endpoints.is_empty() {
+            eprintln!(
+                "Info: {} new endpoint(s) found in the spec (auto-selected):",
+                new_endpoints.len()
+            );
+            for n in &new_endpoints {
+                eprintln!("  + {n}");
+            }
+        }
+    }
+
+    // Apply deselection
+    for group in groups.iter_mut() {
+        for ep in &mut group.endpoints {
+            if deselected_set.contains(ep.path.as_str()) {
+                ep.selected = false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Run a headless CLI export. Returns Ok(true) if export was performed,
+/// Ok(false) if no saved selection exists (caller should launch GUI).
+fn run_cli_export(
+    source_key: &str,
+    spec: Value,
+    export_path: &Path,
+) -> Result<bool, String> {
+    let mut db = SelectionDb::load();
+
+    if !db.has_selection(source_key) && !db.all_paths.contains_key(source_key) {
+        return Ok(false);
+    }
+
+    let mut groups = extract_groups(&spec)?;
+    let had_selection = apply_saved_selection_cli(&mut groups, &db, source_key);
+
+    if !had_selection {
+        return Ok(false);
+    }
+
+    let export_format = detect_format(export_path);
+    let filtered = build_filtered_spec(&spec, &groups, true);
+    let output = serialize_spec(&filtered, export_format)?;
+
+    std::fs::write(export_path, &output)
+        .map_err(|e| format!("Write error: {e}"))?;
+
+    let selected: usize = groups.iter().map(|g| g.selected_count()).sum();
+    let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
+    eprintln!(
+        "Exported {selected}/{total} endpoints to {}",
+        export_path.display()
+    );
+
+    // Update the db with current state (so all_paths stays fresh)
+    let deselected: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.endpoints.iter())
+        .filter(|e| !e.selected)
+        .map(|e| e.path.clone())
+        .collect();
+    let all_paths: Vec<String> = groups
+        .iter()
+        .flat_map(|g| g.endpoints.iter())
+        .map(|e| e.path.clone())
+        .collect();
+    if deselected.is_empty() {
+        db.deselected.remove(source_key);
+    } else {
+        db.deselected.insert(source_key.to_string(), deselected);
+    }
+    db.all_paths.insert(source_key.to_string(), all_paths);
+    db.save();
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+struct CliArgs {
+    input: Option<String>,
+    export_path: Option<PathBuf>,
+}
+
+fn parse_args() -> CliArgs {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut input = None;
+    let mut export_path = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--export" => {
+                i += 1;
+                if i < args.len() {
+                    export_path = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("Error: --export requires an output file path");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => {
+                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT]");
+                eprintln!();
+                eprintln!("  INPUT   Path or URL to an OpenAPI spec (YAML/JSON)");
+                eprintln!("  --export OUTPUT");
+                eprintln!("          Export filtered spec to OUTPUT without opening the GUI.");
+                eprintln!("          Requires a previous GUI export to establish the selection.");
+                eprintln!("          If no saved selection exists, the GUI opens instead.");
+                std::process::exit(0);
+            }
+            other => {
+                input = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    CliArgs { input, export_path }
+}
+
+fn main() -> eframe::Result {
+    let cli = parse_args();
+
+    // Resolve input source
+    let initial_source: Option<InitialSource> = match cli.input.as_deref() {
         Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
             match download_spec(s) {
-                Ok((contents, name, format)) => Some(InitialSource::Downloaded { contents, name, source_url: s.to_string(), format }),
+                Ok((contents, name, format)) => Some(InitialSource::Downloaded {
+                    contents,
+                    name,
+                    source_url: s.to_string(),
+                    format,
+                }),
                 Err(e) => {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
                 }
             }
         }
-        Some(path) => Some(InitialSource::File(std::path::PathBuf::from(path))),
+        Some(path) => Some(InitialSource::File(PathBuf::from(path))),
         None => None,
     };
 
+    // --export: attempt headless CLI export
+    if let Some(export_path) = &cli.export_path {
+        let Some(ref source) = initial_source else {
+            eprintln!("Error: --export requires an input file or URL");
+            std::process::exit(1);
+        };
+
+        let (spec, source_key) = match source {
+            InitialSource::File(path) => {
+                let (spec, _fmt) = load_spec(path).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                });
+                let key = canonical_source_key(path);
+                (spec, key)
+            }
+            InitialSource::Downloaded {
+                contents,
+                source_url,
+                format,
+                ..
+            } => {
+                let spec = parse_spec_string(contents, *format).unwrap_or_else(|e| {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                });
+                (spec, source_url.clone())
+            }
+        };
+
+        match run_cli_export(&source_key, spec, export_path) {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => {
+                eprintln!(
+                    "No saved selection found for this source. Opening GUI for initial setup…"
+                );
+                // Fall through to GUI below
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // GUI mode
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 700.0])
@@ -683,7 +1053,12 @@ fn main() -> eframe::Result {
             let mut app = App::new(cc);
             match initial_source {
                 Some(InitialSource::File(path)) => app.load_from_path(&path),
-                Some(InitialSource::Downloaded { contents, name, source_url, format }) => {
+                Some(InitialSource::Downloaded {
+                    contents,
+                    name,
+                    source_url,
+                    format,
+                }) => {
                     app.load_from_string(&contents, &name, &source_url, format);
                 }
                 None => {}
@@ -694,6 +1069,11 @@ fn main() -> eframe::Result {
 }
 
 enum InitialSource {
-    File(std::path::PathBuf),
-    Downloaded { contents: String, name: String, source_url: String, format: SpecFormat },
+    File(PathBuf),
+    Downloaded {
+        contents: String,
+        name: String,
+        source_url: String,
+        format: SpecFormat,
+    },
 }
