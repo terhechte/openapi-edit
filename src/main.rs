@@ -1,6 +1,7 @@
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,14 @@ impl PathGroup {
     }
 }
 
+/// Persisted map: source identifier (file path or URL) → list of deselected paths.
+#[derive(Default, Serialize, Deserialize)]
+struct SelectionDb {
+    deselected: HashMap<String, Vec<String>>,
+}
+
+const SELECTION_DB_KEY: &str = "selection_db";
+
 struct App {
     spec: Option<Value>,
     source_format: SpecFormat,
@@ -67,10 +76,20 @@ struct App {
     status: String,
     loaded_file_name: Option<String>,
     search_query: String,
+    prune_components: bool,
+    /// The key identifying the current source (absolute path or URL).
+    source_key: Option<String>,
+    /// Persisted selection state across sessions.
+    selection_db: SelectionDb,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let selection_db: SelectionDb = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, SELECTION_DB_KEY))
+            .unwrap_or_default();
+
         Self {
             spec: None,
             source_format: SpecFormat::Yaml,
@@ -79,6 +98,48 @@ impl Default for App {
             status: String::from("Open an OpenAPI spec to get started."),
             loaded_file_name: None,
             search_query: String::new(),
+            prune_components: true,
+            source_key: None,
+            selection_db,
+        }
+    }
+
+    /// Apply saved selection from the db to the current groups.
+    fn apply_saved_selection(&mut self) {
+        let Some(key) = &self.source_key else { return };
+        let Some(deselected) = self.selection_db.deselected.get(key) else { return };
+        let deselected_set: HashSet<&str> = deselected.iter().map(|s| s.as_str()).collect();
+        for group in &mut self.groups {
+            for ep in &mut group.endpoints {
+                if deselected_set.contains(ep.path.as_str()) {
+                    ep.selected = false;
+                }
+            }
+        }
+        let total: usize = self.groups.iter().map(|g| g.endpoints.len()).sum();
+        let selected: usize = self.groups.iter().map(|g| g.selected_count()).sum();
+        if selected < total {
+            self.status = format!(
+                "{} — restored previous selection ({selected}/{total})",
+                self.status
+            );
+        }
+    }
+
+    /// Save the current selection to the db.
+    fn save_selection(&mut self) {
+        let Some(key) = &self.source_key else { return };
+        let deselected: Vec<String> = self
+            .groups
+            .iter()
+            .flat_map(|g| g.endpoints.iter())
+            .filter(|e| !e.selected)
+            .map(|e| e.path.clone())
+            .collect();
+        if deselected.is_empty() {
+            self.selection_db.deselected.remove(key);
+        } else {
+            self.selection_db.deselected.insert(key.clone(), deselected);
         }
     }
 }
@@ -139,11 +200,11 @@ fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
         .collect())
 }
 
-fn build_filtered_spec(spec: &Value, groups: &[PathGroup]) -> Value {
+fn build_filtered_spec(spec: &Value, groups: &[PathGroup], prune: bool) -> Value {
     let mut out = spec.clone();
 
     // Collect deselected paths
-    let deselected: std::collections::HashSet<&str> = groups
+    let deselected: HashSet<&str> = groups
         .iter()
         .flat_map(|g| g.endpoints.iter())
         .filter(|e| !e.selected)
@@ -154,7 +215,106 @@ fn build_filtered_spec(spec: &Value, groups: &[PathGroup]) -> Value {
         paths.retain(|key, _| !deselected.contains(key.as_str()));
     }
 
+    if prune {
+        prune_unused_components(&mut out);
+    }
+
     out
+}
+
+// ---------------------------------------------------------------------------
+// Component pruning — remove unreferenced entries from components/*
+// ---------------------------------------------------------------------------
+
+/// Recursively walk a JSON value and collect all `$ref` strings.
+fn collect_refs(value: &Value, refs: &mut HashSet<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(r)) = map.get("$ref") {
+                refs.insert(r.clone());
+            }
+            for v in map.values() {
+                collect_refs(v, refs);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_refs(v, refs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute the full set of reachable component refs starting from the
+/// non-component parts of the spec (paths, info, security, etc.), then
+/// transitively following refs within reached components.
+fn reachable_component_refs(spec: &Value) -> HashSet<String> {
+    let mut reachable = HashSet::new();
+
+    // Seed: collect refs from everything *except* the components object itself
+    if let Some(obj) = spec.as_object() {
+        for (key, value) in obj {
+            if key != "components" {
+                collect_refs(value, &mut reachable);
+            }
+        }
+    }
+
+    // Transitively resolve: any newly-reachable component may itself contain refs
+    let components = spec.get("components");
+    loop {
+        let mut newly_found = HashSet::new();
+        for r in &reachable {
+            // Parse refs like "#/components/schemas/Foo"
+            if let Some(component_value) = resolve_local_ref(spec, r) {
+                collect_refs(component_value, &mut newly_found);
+            }
+        }
+        // Keep only refs we haven't seen yet
+        let before = reachable.len();
+        reachable.extend(newly_found);
+        if reachable.len() == before {
+            break; // Fixed point reached
+        }
+    }
+
+    let _ = components; // suppress unused warning
+    reachable
+}
+
+/// Resolve a local JSON pointer ref like `#/components/schemas/Foo` to
+/// the corresponding `Value` in the spec.
+fn resolve_local_ref<'a>(spec: &'a Value, reference: &str) -> Option<&'a Value> {
+    let pointer = reference.strip_prefix('#')?;
+    // JSON pointer uses '/' separators; serde_json::Value::pointer expects this format
+    spec.pointer(pointer)
+}
+
+/// Remove unreferenced entries from every sub-section of `components`.
+fn prune_unused_components(spec: &mut Value) {
+    let reachable = reachable_component_refs(spec);
+
+    let Some(components) = spec.get_mut("components").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    // For each sub-section (schemas, responses, parameters, requestBodies, …)
+    for (section_name, section_value) in components.iter_mut() {
+        let Some(section_map) = section_value.as_object_mut() else {
+            continue;
+        };
+        let prefix = format!("#/components/{section_name}/");
+        section_map.retain(|entry_name, _| {
+            let full_ref = format!("{prefix}{entry_name}");
+            reachable.contains(&full_ref)
+        });
+    }
+
+    // Remove empty sub-sections
+    components.retain(|_, v| {
+        v.as_object().map_or(true, |m| !m.is_empty())
+    });
 }
 
 fn serialize_spec(spec: &Value, format: SpecFormat) -> Result<String, String> {
@@ -173,6 +333,10 @@ fn serialize_spec(spec: &Value, format: SpecFormat) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, SELECTION_DB_KEY, &self.selection_db);
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // -- Top panel --
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
@@ -209,6 +373,10 @@ impl eframe::App for App {
                 ui.label("Export as:");
                 ui.radio_value(&mut self.export_format, SpecFormat::Yaml, "YAML");
                 ui.radio_value(&mut self.export_format, SpecFormat::Json, "JSON");
+
+                ui.separator();
+
+                ui.checkbox(&mut self.prune_components, "Remove unused components");
 
                 ui.separator();
 
@@ -342,14 +510,8 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn open_file(&mut self) {
-        let file = rfd::FileDialog::new()
-            .add_filter("OpenAPI Spec", &["yaml", "yml", "json"])
-            .pick_file();
-
-        let Some(path) = file else { return };
-
-        match load_spec(&path) {
+    fn load_from_path(&mut self, path: &Path) {
+        match load_spec(path) {
             Ok((value, format)) => match extract_groups(&value) {
                 Ok(groups) => {
                     let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
@@ -364,6 +526,14 @@ impl App {
                     self.groups = groups;
                     self.loaded_file_name = Some(name);
                     self.search_query.clear();
+                    // Use canonical absolute path as source key
+                    self.source_key = Some(
+                        std::fs::canonicalize(path)
+                            .unwrap_or_else(|_| path.to_path_buf())
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                    self.apply_saved_selection();
                 }
                 Err(e) => {
                     self.status = e;
@@ -375,10 +545,45 @@ impl App {
         }
     }
 
+    fn load_from_string(&mut self, contents: &str, name: &str, source_key: &str, format: SpecFormat) {
+        let parse_result: Result<Value, String> = match format {
+            SpecFormat::Json => serde_json::from_str(contents).map_err(|e| format!("JSON parse error: {e}")),
+            SpecFormat::Yaml => serde_yaml::from_str(contents).map_err(|e| format!("YAML parse error: {e}")),
+        };
+        match parse_result {
+            Ok(value) => match extract_groups(&value) {
+                Ok(groups) => {
+                    let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
+                    self.status = format!("Loaded {name} — {total} endpoints");
+                    self.spec = Some(value);
+                    self.source_format = format;
+                    self.export_format = format;
+                    self.groups = groups;
+                    self.loaded_file_name = Some(name.to_string());
+                    self.search_query.clear();
+                    self.source_key = Some(source_key.to_string());
+                    self.apply_saved_selection();
+                }
+                Err(e) => self.status = e,
+            },
+            Err(e) => self.status = e,
+        }
+    }
+
+    fn open_file(&mut self) {
+        let file = rfd::FileDialog::new()
+            .add_filter("OpenAPI Spec", &["yaml", "yml", "json"])
+            .pick_file();
+
+        if let Some(path) = file {
+            self.load_from_path(&path);
+        }
+    }
+
     fn export_file(&mut self) {
         let Some(spec) = &self.spec else { return };
 
-        let filtered = build_filtered_spec(spec, &self.groups);
+        let filtered = build_filtered_spec(spec, &self.groups, self.prune_components);
 
         match serialize_spec(&filtered, self.export_format) {
             Ok(output) => {
@@ -398,6 +603,7 @@ impl App {
                 if let Some(path) = file {
                     match std::fs::write(&path, &output) {
                         Ok(()) => {
+                            self.save_selection();
                             let selected: usize =
                                 self.groups.iter().map(|g| g.selected_count()).sum();
                             self.status = format!(
@@ -422,7 +628,47 @@ impl App {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Guess format from a URL path or fall back to YAML.
+fn detect_format_from_url(url: &str) -> SpecFormat {
+    if url.ends_with(".json") {
+        SpecFormat::Json
+    } else {
+        SpecFormat::Yaml
+    }
+}
+
+/// Download a URL synchronously, returning (contents, display_name, format).
+fn download_spec(url: &str) -> Result<(String, String, SpecFormat), String> {
+    let body: String = ureq::get(url)
+        .call()
+        .map_err(|e| format!("HTTP request failed: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
+
+    let format = detect_format_from_url(url);
+    let name = url.rsplit('/').next().unwrap_or(url).to_string();
+    Ok((body, name, format))
+}
+
 fn main() -> eframe::Result {
+    let arg = std::env::args().nth(1);
+
+    // If argument looks like a URL, download it before starting the GUI.
+    let initial_source: Option<InitialSource> = match arg.as_deref() {
+        Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
+            match download_spec(s) {
+                Ok((contents, name, format)) => Some(InitialSource::Downloaded { contents, name, source_url: s.to_string(), format }),
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some(path) => Some(InitialSource::File(std::path::PathBuf::from(path))),
+        None => None,
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([600.0, 700.0])
@@ -433,6 +679,21 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "OpenAPI Editor",
         options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|cc| {
+            let mut app = App::new(cc);
+            match initial_source {
+                Some(InitialSource::File(path)) => app.load_from_path(&path),
+                Some(InitialSource::Downloaded { contents, name, source_url, format }) => {
+                    app.load_from_string(&contents, &name, &source_url, format);
+                }
+                None => {}
+            }
+            Ok(Box::new(app))
+        }),
     )
+}
+
+enum InitialSource {
+    File(std::path::PathBuf),
+    Downloaded { contents: String, name: String, source_url: String, format: SpecFormat },
 }
