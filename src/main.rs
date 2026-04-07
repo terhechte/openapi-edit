@@ -152,10 +152,16 @@ struct App {
     source_key: Option<String>,
     /// Persisted selection state across sessions.
     selection_db: SelectionDb,
+    /// If set, Export writes directly to this path (no file dialog).
+    force_export_path: Option<PathBuf>,
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>, db_path: Option<PathBuf>) -> Self {
+    fn new(
+        _cc: &eframe::CreationContext<'_>,
+        db_path: Option<PathBuf>,
+        force_export_path: Option<PathBuf>,
+    ) -> Self {
         Self {
             spec: None,
             source_format: SpecFormat::Yaml,
@@ -167,6 +173,7 @@ impl App {
             prune_components: true,
             source_key: None,
             selection_db: SelectionDb::load(db_path),
+            force_export_path,
         }
     }
 
@@ -713,17 +720,23 @@ impl App {
 
         match serialize_spec(&filtered, self.export_format) {
             Ok(output) => {
-                let default_name = format!("filtered.{}", self.export_format.extension());
+                let path = if let Some(forced) = &self.force_export_path {
+                    Some(forced.clone())
+                } else {
+                    let default_name = format!("filtered.{}", self.export_format.extension());
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-                let file = rfd::FileDialog::new()
-                    .set_file_name(&default_name)
-                    .add_filter(
-                        self.export_format.label(),
-                        &[self.export_format.extension()],
-                    )
-                    .save_file();
+                    rfd::FileDialog::new()
+                        .set_directory(&cwd)
+                        .set_file_name(&default_name)
+                        .add_filter(
+                            self.export_format.label(),
+                            &[self.export_format.extension()],
+                        )
+                        .save_file()
+                };
 
-                if let Some(path) = file {
+                if let Some(path) = path {
                     match std::fs::write(&path, &output) {
                         Ok(()) => {
                             self.save_selection();
@@ -944,6 +957,7 @@ struct CliArgs {
     db_path: Option<PathBuf>,
     user: Option<String>,
     password: Option<String>,
+    force_export_path: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
@@ -953,6 +967,7 @@ fn parse_args() -> CliArgs {
     let mut db_path = None;
     let mut user = None;
     let mut password = None;
+    let mut force_export_path = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -992,14 +1007,26 @@ fn parse_args() -> CliArgs {
                     std::process::exit(1);
                 }
             }
+            "--force-export-path" => {
+                i += 1;
+                if i < args.len() {
+                    force_export_path = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("Error: --force-export-path requires a file path");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT] [--db PATH] [--user USER --password PASSWORD]");
+                eprintln!("Usage: openapi-edit [INPUT] [OPTIONS]");
                 eprintln!();
                 eprintln!("  INPUT   Path or URL to an OpenAPI spec (YAML/JSON)");
                 eprintln!("  --export OUTPUT");
                 eprintln!("          Export filtered spec to OUTPUT without opening the GUI.");
                 eprintln!("          Requires a previous GUI export to establish the selection.");
                 eprintln!("          If no saved selection exists, the GUI opens instead.");
+                eprintln!("  --force-export-path PATH");
+                eprintln!("          In GUI mode, the Export button writes directly to PATH");
+                eprintln!("          instead of opening a file dialog.");
                 eprintln!("  --db PATH");
                 eprintln!("          Use a custom path for the selections database file.");
                 eprintln!("          Defaults to the platform config directory.");
@@ -1021,6 +1048,7 @@ fn parse_args() -> CliArgs {
         db_path,
         user,
         password,
+        force_export_path,
     }
 }
 
@@ -1119,7 +1147,7 @@ fn main() -> eframe::Result {
         "OpenAPI Editor",
         options,
         Box::new(move |cc| {
-            let mut app = App::new(cc, cli.db_path);
+            let mut app = App::new(cc, cli.db_path, cli.force_export_path);
             match initial_source {
                 Some(InitialSource::File(path)) => app.load_from_path(&path),
                 Some(InitialSource::Downloaded {

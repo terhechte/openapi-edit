@@ -51,6 +51,12 @@ openapi-edit https://example.com/api.yaml --user admin --password secret
 
 Use the GUI to select/deselect endpoints, then click **Export** to save the filtered spec. Your selection is automatically remembered for next time.
 
+To skip the export file dialog and always write to a fixed path:
+
+```sh
+openapi-edit spec.yaml --force-export-path ./filtered.yaml
+```
+
 ### Headless export (`--export`)
 
 Re-export a spec using a previously saved selection without opening the GUI:
@@ -75,10 +81,12 @@ When the spec has changed since the last export, the CLI prints diagnostics:
 ### Options
 
 ```
-openapi-edit [INPUT] [--export OUTPUT] [--db PATH] [--user USER --password PASSWORD]
+openapi-edit [INPUT] [OPTIONS]
 
   INPUT              Path or URL to an OpenAPI spec (YAML/JSON)
   --export OUTPUT    Export filtered spec to OUTPUT without opening the GUI
+  --force-export-path PATH
+                     In GUI mode, Export writes directly to PATH (no dialog)
   --db PATH          Use a custom path for the selections database file
   --user USER        Username for HTTP Basic Authentication (URL sources only)
   --password PASSWORD
