@@ -32,9 +32,42 @@ impl SpecFormat {
     }
 }
 
+const HTTP_METHODS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "trace",
+];
+
+struct Operation {
+    method: String,
+    selected: bool,
+}
+
 struct Endpoint {
     path: String,
-    selected: bool,
+    operations: Vec<Operation>,
+}
+
+impl Endpoint {
+    fn all_selected(&self) -> bool {
+        self.operations.iter().all(|op| op.selected)
+    }
+
+    fn none_selected(&self) -> bool {
+        self.operations.iter().all(|op| !op.selected)
+    }
+
+    fn selected_count(&self) -> usize {
+        self.operations.iter().filter(|op| op.selected).count()
+    }
+
+    fn set_all(&mut self, selected: bool) {
+        for op in &mut self.operations {
+            op.selected = selected;
+        }
+    }
+
+    fn operation_count(&self) -> usize {
+        self.operations.len()
+    }
 }
 
 struct PathGroup {
@@ -44,20 +77,24 @@ struct PathGroup {
 
 impl PathGroup {
     fn all_selected(&self) -> bool {
-        self.endpoints.iter().all(|e| e.selected)
+        self.endpoints.iter().all(|e| e.all_selected())
     }
 
     fn none_selected(&self) -> bool {
-        self.endpoints.iter().all(|e| !e.selected)
+        self.endpoints.iter().all(|e| e.none_selected())
     }
 
     fn selected_count(&self) -> usize {
-        self.endpoints.iter().filter(|e| e.selected).count()
+        self.endpoints.iter().map(|e| e.selected_count()).sum()
+    }
+
+    fn operation_count(&self) -> usize {
+        self.endpoints.iter().map(|e| e.operation_count()).sum()
     }
 
     fn set_all(&mut self, selected: bool) {
         for ep in &mut self.endpoints {
-            ep.selected = selected;
+            ep.set_all(selected);
         }
     }
 }
@@ -181,56 +218,29 @@ impl App {
     }
 
     /// Apply saved selection from the db to the current groups.
-    /// Returns (removed_endpoints, new_endpoints) for diagnostics.
-    fn apply_saved_selection(&mut self) -> (Vec<String>, Vec<String>) {
+    fn apply_saved_selection(&mut self) {
         let Some(key) = &self.source_key else {
-            return (vec![], vec![]);
+            return;
         };
         let Some(saved_deselected) = self.selection_db.deselected.get(key) else {
-            return (vec![], vec![]);
+            return;
         };
 
         let saved_set: HashSet<&str> = saved_deselected.iter().map(|s| s.as_str()).collect();
 
-        // All current endpoint paths
-        let current_paths: HashSet<&str> = self
-            .groups
-            .iter()
-            .flat_map(|g| g.endpoints.iter())
-            .map(|e| e.path.as_str())
-            .collect();
-
-        // Endpoints that were in the saved selection but no longer exist in the spec
-        let removed: Vec<String> = saved_deselected
-            .iter()
-            .filter(|p| !current_paths.contains(p.as_str()))
-            .cloned()
-            .collect();
-
-        // Apply deselection to endpoints that still exist
+        // Apply deselection: keys are "METHOD /path"
         for group in &mut self.groups {
             for ep in &mut group.endpoints {
-                if saved_set.contains(ep.path.as_str()) {
-                    ep.selected = false;
+                for op in &mut ep.operations {
+                    let key = format!("{} {}", op.method, ep.path);
+                    if saved_set.contains(key.as_str()) {
+                        op.selected = false;
+                    }
                 }
             }
         }
 
-        // New endpoints = those in current spec that weren't in the previous
-        // known set. We reconstruct the previous full set as:
-        // previously selected = current_paths - saved_deselected + removed
-        // But simpler: new endpoints are those not mentioned in saved_deselected
-        // AND not previously selected. Since we only store deselected, any
-        // endpoint not in saved_deselected was previously selected (or is new).
-        // We can't distinguish those without storing the full path list.
-        // Instead, we'll also store the full set of known paths.
-        // For now: new = in current but not in (saved_deselected ∪ previously_selected_paths).
-        // We approximate: endpoints are "new" if they didn't exist in the previous
-        // spec at all. We need the full previous path list for that.
-        // → We'll enhance SelectionDb to also store all_paths.
-        let new_endpoints: Vec<String> = vec![]; // handled below via enhanced db
-
-        let total: usize = self.groups.iter().map(|g| g.endpoints.len()).sum();
+        let total: usize = self.groups.iter().map(|g| g.operation_count()).sum();
         let selected: usize = self.groups.iter().map(|g| g.selected_count()).sum();
         if selected < total {
             self.status = format!(
@@ -238,8 +248,6 @@ impl App {
                 self.status
             );
         }
-
-        (removed, new_endpoints)
     }
 
     /// Save the current selection to the db.
@@ -249,21 +257,28 @@ impl App {
             .groups
             .iter()
             .flat_map(|g| g.endpoints.iter())
-            .filter(|e| !e.selected)
-            .map(|e| e.path.clone())
+            .flat_map(|e| {
+                e.operations
+                    .iter()
+                    .filter(|op| !op.selected)
+                    .map(|op| format!("{} {}", op.method, e.path))
+            })
             .collect();
         let all_paths: Vec<String> = self
             .groups
             .iter()
             .flat_map(|g| g.endpoints.iter())
-            .map(|e| e.path.clone())
+            .flat_map(|e| {
+                e.operations
+                    .iter()
+                    .map(|op| format!("{} {}", op.method, e.path))
+            })
             .collect();
         if deselected.is_empty() {
             self.selection_db.deselected.remove(key);
         } else {
             self.selection_db.deselected.insert(key.clone(), deselected);
         }
-        // Always store the full path list so we can detect new/removed later
         self.selection_db.all_paths.insert(key.clone(), all_paths);
         self.selection_db.save();
     }
@@ -313,7 +328,7 @@ fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
 
     let mut map: BTreeMap<String, Vec<Endpoint>> = BTreeMap::new();
 
-    for key in paths_obj.keys() {
+    for (key, path_item) in paths_obj {
         let group_name = key.trim_start_matches('/').split('/').next().unwrap_or("/");
         let group_name = if group_name.is_empty() {
             "/"
@@ -321,12 +336,23 @@ fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
             group_name
         };
 
-        map.entry(group_name.to_string())
-            .or_default()
-            .push(Endpoint {
-                path: key.clone(),
+        let operations: Vec<Operation> = HTTP_METHODS
+            .iter()
+            .filter(|m| path_item.get(**m).is_some())
+            .map(|m| Operation {
+                method: m.to_string(),
                 selected: true,
-            });
+            })
+            .collect();
+
+        if !operations.is_empty() {
+            map.entry(group_name.to_string())
+                .or_default()
+                .push(Endpoint {
+                    path: key.clone(),
+                    operations,
+                });
+        }
     }
 
     // Sort endpoints within each group
@@ -343,16 +369,36 @@ fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
 fn build_filtered_spec(spec: &Value, groups: &[PathGroup], prune: bool) -> Value {
     let mut out = spec.clone();
 
-    // Collect deselected paths
-    let deselected: HashSet<&str> = groups
-        .iter()
-        .flat_map(|g| g.endpoints.iter())
-        .filter(|e| !e.selected)
-        .map(|e| e.path.as_str())
-        .collect();
+    // Build a map: path → set of deselected methods
+    let mut deselected_ops: HashMap<&str, HashSet<&str>> = HashMap::new();
+    let mut fully_deselected: HashSet<&str> = HashSet::new();
+
+    for group in groups {
+        for ep in &group.endpoints {
+            if ep.none_selected() {
+                fully_deselected.insert(ep.path.as_str());
+            } else if !ep.all_selected() {
+                let methods: HashSet<&str> = ep
+                    .operations
+                    .iter()
+                    .filter(|op| !op.selected)
+                    .map(|op| op.method.as_str())
+                    .collect();
+                deselected_ops.insert(ep.path.as_str(), methods);
+            }
+        }
+    }
 
     if let Some(paths) = out.get_mut("paths").and_then(|v| v.as_object_mut()) {
-        paths.retain(|key, _| !deselected.contains(key.as_str()));
+        // Remove fully deselected paths
+        paths.retain(|key, _| !fully_deselected.contains(key.as_str()));
+
+        // Remove individual deselected methods from partially selected paths
+        for (path_key, methods) in &deselected_ops {
+            if let Some(path_item) = paths.get_mut(*path_key).and_then(|v| v.as_object_mut()) {
+                path_item.retain(|method, _| !methods.contains(method.as_str()));
+            }
+        }
     }
 
     if prune {
@@ -548,8 +594,9 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 if !self.groups.is_empty() {
                     let selected: usize = self.groups.iter().map(|g| g.selected_count()).sum();
-                    let total: usize = self.groups.iter().map(|g| g.endpoints.len()).sum();
-                    ui.label(format!("Selected: {selected} / {total} endpoints"));
+                    let total: usize =
+                        self.groups.iter().map(|g| g.operation_count()).sum();
+                    ui.label(format!("Selected: {selected} / {total} operations"));
                     ui.separator();
                 }
                 ui.label(&self.status);
@@ -609,10 +656,13 @@ impl eframe::App for App {
                         continue; // Skip group entirely if no matches
                     }
 
-                    let ep_count = if query.is_empty() {
-                        group.endpoints.len()
+                    let op_count = if query.is_empty() {
+                        group.operation_count()
                     } else {
-                        visible_indices.len()
+                        visible_indices
+                            .iter()
+                            .map(|&i| group.endpoints[i].operation_count())
+                            .sum()
                     };
 
                     // Group row: checkbox + collapsing header
@@ -622,7 +672,7 @@ impl eframe::App for App {
                         // Tri-state checkbox for group
                         let all = group.all_selected();
                         let none = group.none_selected();
-                        let mut state = !none; // checked if any are selected
+                        let mut state = !none;
 
                         let response = ui.checkbox(&mut state, "");
 
@@ -645,30 +695,75 @@ impl eframe::App for App {
                         }
 
                         let header_text = format!(
-                            "/{} ({} endpoint{})",
+                            "/{} ({} operation{})",
                             group.name,
-                            ep_count,
-                            if ep_count == 1 { "" } else { "s" }
+                            op_count,
+                            if op_count == 1 { "" } else { "s" }
                         );
 
                         egui::CollapsingHeader::new(egui::RichText::new(header_text).strong())
                             .id_salt(id)
                             .default_open(false)
                             .show(ui, |ui| {
-                                let render_ep = |ui: &mut egui::Ui,
-                                                 ep: &mut Endpoint,
-                                                 info_ep: &mut Option<String>| {
-                                    ui.horizontal(|ui| {
-                                        ui.checkbox(&mut ep.selected, &ep.path);
-                                        if ui
-                                            .small_button("i")
-                                            .on_hover_text("Show endpoint details")
-                                            .clicked()
-                                        {
-                                            *info_ep = Some(ep.path.clone());
-                                        }
-                                    });
-                                };
+                                let render_ep =
+                                    |ui: &mut egui::Ui,
+                                     ep: &mut Endpoint,
+                                     info_ep: &mut Option<String>| {
+                                        ui.horizontal(|ui| {
+                                            // Endpoint-level tri-state checkbox
+                                            let all = ep.all_selected();
+                                            let none = ep.none_selected();
+                                            let mut state = !none;
+
+                                            let response = ui.checkbox(&mut state, "");
+
+                                            if !all && !none {
+                                                let rect = response.rect;
+                                                let center = rect.center();
+                                                let half = rect.width() * 0.2;
+                                                ui.painter().line_segment(
+                                                    [
+                                                        egui::pos2(center.x - half, center.y),
+                                                        egui::pos2(center.x + half, center.y),
+                                                    ],
+                                                    egui::Stroke::new(
+                                                        2.0,
+                                                        ui.visuals().text_color(),
+                                                    ),
+                                                );
+                                            }
+
+                                            if response.changed() {
+                                                ep.set_all(state);
+                                            }
+
+                                            ui.label(&ep.path);
+
+                                            if ui
+                                                .small_button("i")
+                                                .on_hover_text("Show endpoint details")
+                                                .clicked()
+                                            {
+                                                *info_ep = Some(ep.path.clone());
+                                            }
+                                        });
+
+                                        // Individual operation checkboxes
+                                        ui.indent(ui.make_persistent_id(&ep.path), |ui| {
+                                            for op in &mut ep.operations {
+                                                ui.horizontal(|ui| {
+                                                    ui.checkbox(&mut op.selected, "");
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            op.method.to_uppercase(),
+                                                        )
+                                                        .color(method_color(&op.method))
+                                                        .strong(),
+                                                    );
+                                                });
+                                            }
+                                        });
+                                    };
                                 if query.is_empty() {
                                     for ep in &mut group.endpoints {
                                         render_ep(ui, ep, &mut info_endpoint);
@@ -698,12 +793,8 @@ impl App {
             return;
         };
 
-        let methods = [
-            "get", "post", "put", "patch", "delete", "head", "options", "trace",
-        ];
-
         let mut first = true;
-        for method in &methods {
+        for method in HTTP_METHODS {
             let Some(op) = path_item.get(*method) else {
                 continue;
             };
@@ -835,12 +926,12 @@ impl App {
         match load_spec(path) {
             Ok((value, format)) => match extract_groups(&value) {
                 Ok(groups) => {
-                    let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
+                    let total: usize = groups.iter().map(|g| g.operation_count()).sum();
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    self.status = format!("Loaded {name} — {total} endpoints");
+                    self.status = format!("Loaded {name} — {total} operations");
                     self.spec = Some(value);
                     self.source_format = format;
                     self.export_format = format;
@@ -870,8 +961,8 @@ impl App {
         match parse_spec_string(contents, format) {
             Ok(value) => match extract_groups(&value) {
                 Ok(groups) => {
-                    let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
-                    self.status = format!("Loaded {name} — {total} endpoints");
+                    let total: usize = groups.iter().map(|g| g.operation_count()).sum();
+                    self.status = format!("Loaded {name} — {total} operations");
                     self.spec = Some(value);
                     self.source_format = format;
                     self.export_format = format;
@@ -927,7 +1018,7 @@ impl App {
                             let selected: usize =
                                 self.groups.iter().map(|g| g.selected_count()).sum();
                             self.status =
-                                format!("Exported {selected} endpoints to {}", path.display());
+                                format!("Exported {selected} operations to {}", path.display());
                         }
                         Err(e) => {
                             self.status = format!("Write error: {e}");
@@ -1004,7 +1095,7 @@ fn download_spec(
 // ---------------------------------------------------------------------------
 
 /// Apply a saved selection to groups, detecting spec drift.
-/// Prints warnings for removed endpoints and info for new ones.
+/// Prints warnings for removed operations and info for new ones.
 /// Returns `true` if a saved selection was found and applied.
 fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_key: &str) -> bool {
     let Some(saved_deselected) = db.deselected.get(source_key) else {
@@ -1013,23 +1104,27 @@ fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_
 
     let deselected_set: HashSet<&str> = saved_deselected.iter().map(|s| s.as_str()).collect();
 
-    // Current endpoint paths
-    let current_paths: HashSet<String> = groups
+    // Current operation keys: "METHOD /path"
+    let current_ops: HashSet<String> = groups
         .iter()
         .flat_map(|g| g.endpoints.iter())
-        .map(|e| e.path.clone())
+        .flat_map(|e| {
+            e.operations
+                .iter()
+                .map(|op| format!("{} {}", op.method, e.path))
+        })
         .collect();
 
-    // Detect removed endpoints (were deselected but no longer in spec)
+    // Detect removed operations (were deselected but no longer in spec)
     let removed: Vec<&str> = saved_deselected
         .iter()
         .map(|s| s.as_str())
-        .filter(|p| !current_paths.contains(*p))
+        .filter(|p| !current_ops.contains(*p))
         .collect();
 
     if !removed.is_empty() {
         eprintln!(
-            "Warning: {} previously deselected endpoint(s) no longer exist in the spec:",
+            "Warning: {} previously deselected operation(s) no longer exist in the spec:",
             removed.len()
         );
         for r in &removed {
@@ -1037,17 +1132,17 @@ fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_
         }
     }
 
-    // Detect removed endpoints that were previously *selected*
+    // Detect removed operations that were previously *selected*
     if let Some(saved_all) = db.all_paths.get(source_key) {
         let prev_set: HashSet<&str> = saved_all.iter().map(|s| s.as_str()).collect();
         let removed_selected: Vec<&str> = prev_set
             .iter()
-            .filter(|p| !current_paths.contains(**p) && !deselected_set.contains(**p))
+            .filter(|p| !current_ops.contains(**p) && !deselected_set.contains(**p))
             .copied()
             .collect();
         if !removed_selected.is_empty() {
             eprintln!(
-                "Warning: {} previously selected endpoint(s) no longer exist in the spec:",
+                "Warning: {} previously selected operation(s) no longer exist in the spec:",
                 removed_selected.len()
             );
             for r in &removed_selected {
@@ -1055,19 +1150,19 @@ fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_
             }
         }
 
-        // Detect new endpoints (in current spec but not in previous known set)
-        let mut new_endpoints: Vec<&str> = current_paths
+        // Detect new operations (in current spec but not in previous known set)
+        let mut new_ops: Vec<&str> = current_ops
             .iter()
             .map(|s| s.as_str())
             .filter(|p| !prev_set.contains(p))
             .collect();
-        new_endpoints.sort();
-        if !new_endpoints.is_empty() {
+        new_ops.sort();
+        if !new_ops.is_empty() {
             eprintln!(
-                "Info: {} new endpoint(s) found in the spec (auto-selected):",
-                new_endpoints.len()
+                "Info: {} new operation(s) found in the spec (auto-selected):",
+                new_ops.len()
             );
-            for n in &new_endpoints {
+            for n in &new_ops {
                 eprintln!("  + {n}");
             }
         }
@@ -1076,8 +1171,11 @@ fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_
     // Apply deselection
     for group in groups.iter_mut() {
         for ep in &mut group.endpoints {
-            if deselected_set.contains(ep.path.as_str()) {
-                ep.selected = false;
+            for op in &mut ep.operations {
+                let key = format!("{} {}", op.method, ep.path);
+                if deselected_set.contains(key.as_str()) {
+                    op.selected = false;
+                }
             }
         }
     }
@@ -1113,9 +1211,9 @@ fn run_cli_export(
     std::fs::write(export_path, &output).map_err(|e| format!("Write error: {e}"))?;
 
     let selected: usize = groups.iter().map(|g| g.selected_count()).sum();
-    let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
+    let total: usize = groups.iter().map(|g| g.operation_count()).sum();
     eprintln!(
-        "Exported {selected}/{total} endpoints to {}",
+        "Exported {selected}/{total} operations to {}",
         export_path.display()
     );
 
@@ -1123,13 +1221,21 @@ fn run_cli_export(
     let deselected: Vec<String> = groups
         .iter()
         .flat_map(|g| g.endpoints.iter())
-        .filter(|e| !e.selected)
-        .map(|e| e.path.clone())
+        .flat_map(|e| {
+            e.operations
+                .iter()
+                .filter(|op| !op.selected)
+                .map(|op| format!("{} {}", op.method, e.path))
+        })
         .collect();
     let all_paths: Vec<String> = groups
         .iter()
         .flat_map(|g| g.endpoints.iter())
-        .map(|e| e.path.clone())
+        .flat_map(|e| {
+            e.operations
+                .iter()
+                .map(|op| format!("{} {}", op.method, e.path))
+        })
         .collect();
     if deselected.is_empty() {
         db.deselected.remove(source_key);
