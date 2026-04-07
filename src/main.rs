@@ -154,6 +154,8 @@ struct App {
     selection_db: SelectionDb,
     /// If set, Export writes directly to this path (no file dialog).
     force_export_path: Option<PathBuf>,
+    /// Currently open info popup (endpoint path), if any.
+    info_endpoint: Option<String>,
 }
 
 impl App {
@@ -174,6 +176,7 @@ impl App {
             source_key: None,
             selection_db: SelectionDb::load(db_path),
             force_export_path,
+            info_endpoint: None,
         }
     }
 
@@ -554,6 +557,29 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
 
+        // -- Right detail panel (shown when an endpoint is selected for info) --
+        if let Some(ref ep_path) = self.info_endpoint.clone() {
+            egui::SidePanel::right("detail_panel")
+                .default_width(350.0)
+                .min_width(250.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(ep_path);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕").clicked() {
+                                self.info_endpoint = None;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        if let Some(spec) = &self.spec {
+                            Self::render_endpoint_info(ui, spec, ep_path);
+                        }
+                    });
+                });
+        }
+
         // -- Central panel: tree --
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.groups.is_empty() {
@@ -564,6 +590,7 @@ impl eframe::App for App {
             }
 
             let query = self.search_query.to_lowercase();
+            let mut info_endpoint = None::<String>;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for group in &mut self.groups {
@@ -628,25 +655,182 @@ impl eframe::App for App {
                             .id_salt(id)
                             .default_open(false)
                             .show(ui, |ui| {
+                                let render_ep = |ui: &mut egui::Ui,
+                                                 ep: &mut Endpoint,
+                                                 info_ep: &mut Option<String>| {
+                                    ui.horizontal(|ui| {
+                                        ui.checkbox(&mut ep.selected, &ep.path);
+                                        if ui
+                                            .small_button("i")
+                                            .on_hover_text("Show endpoint details")
+                                            .clicked()
+                                        {
+                                            *info_ep = Some(ep.path.clone());
+                                        }
+                                    });
+                                };
                                 if query.is_empty() {
                                     for ep in &mut group.endpoints {
-                                        ui.checkbox(&mut ep.selected, &ep.path);
+                                        render_ep(ui, ep, &mut info_endpoint);
                                     }
                                 } else {
                                     for &idx in &visible_indices {
                                         let ep = &mut group.endpoints[idx];
-                                        ui.checkbox(&mut ep.selected, &ep.path);
+                                        render_ep(ui, ep, &mut info_endpoint);
                                     }
                                 }
                             });
                     });
                 }
             });
+
+            if let Some(path) = info_endpoint {
+                self.info_endpoint = Some(path);
+            }
         });
     }
 }
 
 impl App {
+    fn render_endpoint_info(ui: &mut egui::Ui, spec: &Value, ep_path: &str) {
+        let Some(path_item) = spec.get("paths").and_then(|p| p.get(ep_path)) else {
+            ui.label("Endpoint not found in spec.");
+            return;
+        };
+
+        let methods = [
+            "get", "post", "put", "patch", "delete", "head", "options", "trace",
+        ];
+
+        let mut first = true;
+        for method in &methods {
+            let Some(op) = path_item.get(*method) else {
+                continue;
+            };
+
+            if !first {
+                ui.separator();
+            }
+            first = false;
+
+            ui.heading(
+                egui::RichText::new(method.to_uppercase())
+                    .strong()
+                    .color(method_color(*method)),
+            );
+
+            if let Some(summary) = op.get("summary").and_then(|v| v.as_str()) {
+                ui.label(egui::RichText::new(summary).strong());
+            }
+            if let Some(desc) = op.get("description").and_then(|v| v.as_str()) {
+                ui.label(desc);
+            }
+            if let Some(op_id) = op.get("operationId").and_then(|v| v.as_str()) {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("operationId:").weak());
+                    ui.code(op_id);
+                });
+            }
+            if let Some(tags) = op.get("tags").and_then(|v| v.as_array()) {
+                let tag_strs: Vec<&str> = tags.iter().filter_map(|t| t.as_str()).collect();
+                if !tag_strs.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("tags:").weak());
+                        ui.label(tag_strs.join(", "));
+                    });
+                }
+            }
+
+            // Parameters
+            let params: Vec<&Value> = path_item
+                .get("parameters")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .chain(
+                    op.get("parameters")
+                        .and_then(|v| v.as_array())
+                        .into_iter()
+                        .flatten(),
+                )
+                .collect();
+
+            if !params.is_empty() {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Parameters").strong());
+                egui::Grid::new(format!("{ep_path}_{method}_params"))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Name").weak());
+                        ui.label(egui::RichText::new("In").weak());
+                        ui.label(egui::RichText::new("Type").weak());
+                        ui.label(egui::RichText::new("Required").weak());
+                        ui.end_row();
+
+                        for param in &params {
+                            let name = param.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                            let loc = param.get("in").and_then(|v| v.as_str()).unwrap_or("?");
+                            let typ = param
+                                .get("schema")
+                                .and_then(|s| s.get("type"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("-");
+                            let required = param
+                                .get("required")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            ui.label(name);
+                            ui.label(loc);
+                            ui.label(typ);
+                            ui.label(if required { "yes" } else { "no" });
+                            ui.end_row();
+                        }
+                    });
+            }
+
+            // Request body
+            if let Some(body) = op.get("requestBody") {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Request Body").strong());
+                if let Some(desc) = body.get("description").and_then(|v| v.as_str()) {
+                    ui.label(desc);
+                }
+                if let Some(content) = body.get("content").and_then(|v| v.as_object()) {
+                    let types: Vec<&str> = content.keys().map(|k| k.as_str()).collect();
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Content types:").weak());
+                        ui.label(types.join(", "));
+                    });
+                }
+            }
+
+            // Responses
+            if let Some(responses) = op.get("responses").and_then(|v| v.as_object()) {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Responses").strong());
+                egui::Grid::new(format!("{ep_path}_{method}_responses"))
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("Status").weak());
+                        ui.label(egui::RichText::new("Description").weak());
+                        ui.end_row();
+
+                        for (status, resp) in responses {
+                            let desc =
+                                resp.get("description").and_then(|v| v.as_str()).unwrap_or("-");
+                            ui.label(egui::RichText::new(status.as_str()).code());
+                            ui.label(desc);
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+
+        if first {
+            ui.label("No HTTP methods found for this endpoint.");
+        }
+    }
+
     fn load_from_path(&mut self, path: &Path) {
         match load_spec(path) {
             Ok((value, format)) => match extract_groups(&value) {
@@ -761,6 +945,17 @@ impl App {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+fn method_color(method: &str) -> egui::Color32 {
+    match method {
+        "get" => egui::Color32::from_rgb(97, 175, 254),
+        "post" => egui::Color32::from_rgb(73, 204, 144),
+        "put" => egui::Color32::from_rgb(252, 161, 48),
+        "patch" => egui::Color32::from_rgb(80, 227, 194),
+        "delete" => egui::Color32::from_rgb(249, 62, 62),
+        _ => egui::Color32::from_rgb(183, 183, 183),
+    }
+}
 
 /// Canonical source key for a local file path.
 fn canonical_source_key(path: &Path) -> String {
