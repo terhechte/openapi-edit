@@ -253,9 +253,7 @@ impl App {
             self.selection_db.deselected.insert(key.clone(), deselected);
         }
         // Always store the full path list so we can detect new/removed later
-        self.selection_db
-            .all_paths
-            .insert(key.clone(), all_paths);
+        self.selection_db.all_paths.insert(key.clone(), all_paths);
         self.selection_db.save();
     }
 }
@@ -305,12 +303,12 @@ fn extract_groups(spec: &Value) -> Result<Vec<PathGroup>, String> {
     let mut map: BTreeMap<String, Vec<Endpoint>> = BTreeMap::new();
 
     for key in paths_obj.keys() {
-        let group_name = key
-            .trim_start_matches('/')
-            .split('/')
-            .next()
-            .unwrap_or("/");
-        let group_name = if group_name.is_empty() { "/" } else { group_name };
+        let group_name = key.trim_start_matches('/').split('/').next().unwrap_or("/");
+        let group_name = if group_name.is_empty() {
+            "/"
+        } else {
+            group_name
+        };
 
         map.entry(group_name.to_string())
             .or_default()
@@ -618,23 +616,21 @@ impl eframe::App for App {
                             if ep_count == 1 { "" } else { "s" }
                         );
 
-                        egui::CollapsingHeader::new(
-                            egui::RichText::new(header_text).strong(),
-                        )
-                        .id_salt(id)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            if query.is_empty() {
-                                for ep in &mut group.endpoints {
-                                    ui.checkbox(&mut ep.selected, &ep.path);
+                        egui::CollapsingHeader::new(egui::RichText::new(header_text).strong())
+                            .id_salt(id)
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if query.is_empty() {
+                                    for ep in &mut group.endpoints {
+                                        ui.checkbox(&mut ep.selected, &ep.path);
+                                    }
+                                } else {
+                                    for &idx in &visible_indices {
+                                        let ep = &mut group.endpoints[idx];
+                                        ui.checkbox(&mut ep.selected, &ep.path);
+                                    }
                                 }
-                            } else {
-                                for &idx in &visible_indices {
-                                    let ep = &mut group.endpoints[idx];
-                                    ui.checkbox(&mut ep.selected, &ep.path);
-                                }
-                            }
-                        });
+                            });
                     });
                 }
             });
@@ -732,10 +728,8 @@ impl App {
                             self.save_selection();
                             let selected: usize =
                                 self.groups.iter().map(|g| g.selected_count()).sum();
-                            self.status = format!(
-                                "Exported {selected} endpoints to {}",
-                                path.display()
-                            );
+                            self.status =
+                                format!("Exported {selected} endpoints to {}", path.display());
                         }
                         Err(e) => {
                             self.status = format!("Write error: {e}");
@@ -792,11 +786,7 @@ fn download_spec(url: &str) -> Result<(String, String, SpecFormat), String> {
 /// Apply a saved selection to groups, detecting spec drift.
 /// Prints warnings for removed endpoints and info for new ones.
 /// Returns `true` if a saved selection was found and applied.
-fn apply_saved_selection_cli(
-    groups: &mut [PathGroup],
-    db: &SelectionDb,
-    source_key: &str,
-) -> bool {
+fn apply_saved_selection_cli(groups: &mut [PathGroup], db: &SelectionDb, source_key: &str) -> bool {
     let Some(saved_deselected) = db.deselected.get(source_key) else {
         return false;
     };
@@ -900,8 +890,7 @@ fn run_cli_export(
     let filtered = build_filtered_spec(&spec, &groups, true);
     let output = serialize_spec(&filtered, export_format)?;
 
-    std::fs::write(export_path, &output)
-        .map_err(|e| format!("Write error: {e}"))?;
+    std::fs::write(export_path, &output).map_err(|e| format!("Write error: {e}"))?;
 
     let selected: usize = groups.iter().map(|g| g.selected_count()).sum();
     let total: usize = groups.iter().map(|g| g.endpoints.len()).sum();
@@ -988,7 +977,11 @@ fn parse_args() -> CliArgs {
         }
         i += 1;
     }
-    CliArgs { input, export_path, db_path }
+    CliArgs {
+        input,
+        export_path,
+        db_path,
+    }
 }
 
 fn main() -> eframe::Result {
@@ -1072,7 +1065,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([675.0, 700.0])
+            .with_inner_size([745.0, 700.0])
             .with_min_inner_size([400.0, 300.0])
             .with_icon(icon),
         ..Default::default()
