@@ -10,3 +10,4 @@ serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
 rfd = "0.15"
 ureq = "3"
+image = { version = "0.25", default-features = false, features = ["png"] }

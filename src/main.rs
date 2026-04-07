@@ -1,4 +1,5 @@
 use eframe::egui;
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -73,6 +74,9 @@ struct SelectionDb {
     /// Used to detect new/removed endpoints when the spec changes.
     #[serde(default)]
     all_paths: HashMap<String, Vec<String>>,
+    /// Runtime-only: overridden file path for the DB.
+    #[serde(skip)]
+    custom_path: Option<PathBuf>,
 }
 
 impl SelectionDb {
@@ -97,16 +101,18 @@ impl SelectionDb {
         Self::config_dir().join("selections.json")
     }
 
-    fn load() -> Self {
-        let path = Self::db_path();
-        match std::fs::read_to_string(&path) {
+    fn load(custom_path: Option<PathBuf>) -> Self {
+        let path = custom_path.clone().unwrap_or_else(Self::db_path);
+        let mut db = match std::fs::read_to_string(&path) {
             Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        db.custom_path = custom_path;
+        db
     }
 
     fn save(&self) {
-        let path = Self::db_path();
+        let path = self.custom_path.clone().unwrap_or_else(Self::db_path);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -148,7 +154,7 @@ struct App {
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, db_path: Option<PathBuf>) -> Self {
         Self {
             spec: None,
             source_format: SpecFormat::Yaml,
@@ -159,7 +165,7 @@ impl App {
             search_query: String::new(),
             prune_components: true,
             source_key: None,
-            selection_db: SelectionDb::load(),
+            selection_db: SelectionDb::load(db_path),
         }
     }
 
@@ -875,8 +881,9 @@ fn run_cli_export(
     source_key: &str,
     spec: Value,
     export_path: &Path,
+    db_path: Option<PathBuf>,
 ) -> Result<bool, String> {
-    let mut db = SelectionDb::load();
+    let mut db = SelectionDb::load(db_path);
 
     if !db.has_selection(source_key) && !db.all_paths.contains_key(source_key) {
         return Ok(false);
@@ -933,12 +940,14 @@ fn run_cli_export(
 struct CliArgs {
     input: Option<String>,
     export_path: Option<PathBuf>,
+    db_path: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut input = None;
     let mut export_path = None;
+    let mut db_path = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -951,14 +960,26 @@ fn parse_args() -> CliArgs {
                     std::process::exit(1);
                 }
             }
+            "--db" => {
+                i += 1;
+                if i < args.len() {
+                    db_path = Some(PathBuf::from(&args[i]));
+                } else {
+                    eprintln!("Error: --db requires a file path");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT]");
+                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT] [--db PATH]");
                 eprintln!();
                 eprintln!("  INPUT   Path or URL to an OpenAPI spec (YAML/JSON)");
                 eprintln!("  --export OUTPUT");
                 eprintln!("          Export filtered spec to OUTPUT without opening the GUI.");
                 eprintln!("          Requires a previous GUI export to establish the selection.");
                 eprintln!("          If no saved selection exists, the GUI opens instead.");
+                eprintln!("  --db PATH");
+                eprintln!("          Use a custom path for the selections database file.");
+                eprintln!("          Defaults to the platform config directory.");
                 std::process::exit(0);
             }
             other => {
@@ -967,7 +988,7 @@ fn parse_args() -> CliArgs {
         }
         i += 1;
     }
-    CliArgs { input, export_path }
+    CliArgs { input, export_path, db_path }
 }
 
 fn main() -> eframe::Result {
@@ -1023,7 +1044,7 @@ fn main() -> eframe::Result {
             }
         };
 
-        match run_cli_export(&source_key, spec, export_path) {
+        match run_cli_export(&source_key, spec, export_path, cli.db_path.clone()) {
             Ok(true) => std::process::exit(0),
             Ok(false) => {
                 eprintln!(
@@ -1039,18 +1060,29 @@ fn main() -> eframe::Result {
     }
 
     // GUI mode
+    let icon_png = include_bytes!("../media/logo.png");
+    let icon_image = image::load_from_memory(icon_png).expect("Failed to decode embedded icon");
+    let icon_rgba = icon_image.to_rgba8();
+    let (icon_w, icon_h) = icon_image.dimensions();
+    let icon = egui::IconData {
+        rgba: icon_rgba.into_raw(),
+        width: icon_w,
+        height: icon_h,
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 700.0])
-            .with_min_inner_size([400.0, 300.0]),
+            .with_inner_size([675.0, 700.0])
+            .with_min_inner_size([400.0, 300.0])
+            .with_icon(icon),
         ..Default::default()
     };
 
     eframe::run_native(
         "OpenAPI Editor",
         options,
-        Box::new(|cc| {
-            let mut app = App::new(cc);
+        Box::new(move |cc| {
+            let mut app = App::new(cc, cli.db_path);
             match initial_source {
                 Some(InitialSource::File(path)) => app.load_from_path(&path),
                 Some(InitialSource::Downloaded {

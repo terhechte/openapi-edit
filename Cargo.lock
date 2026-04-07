@@ -2331,6 +2331,7 @@ name = "openapi-edit"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "rfd",
  "serde",
  "serde_json",
