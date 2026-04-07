@@ -1,3 +1,4 @@
+use base64::Engine;
 use eframe::egui;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
@@ -766,8 +767,19 @@ fn detect_format_from_url(url: &str) -> SpecFormat {
 }
 
 /// Download a URL synchronously, returning (contents, display_name, format).
-fn download_spec(url: &str) -> Result<(String, String, SpecFormat), String> {
-    let body: String = ureq::get(url)
+fn download_spec(
+    url: &str,
+    basic_auth: Option<(&str, &str)>,
+) -> Result<(String, String, SpecFormat), String> {
+    let mut req = ureq::get(url);
+
+    if let Some((user, password)) = basic_auth {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        req = req.header("Authorization", &format!("Basic {encoded}"));
+    }
+
+    let body: String = req
         .call()
         .map_err(|e| format!("HTTP request failed: {e}"))?
         .body_mut()
@@ -930,6 +942,8 @@ struct CliArgs {
     input: Option<String>,
     export_path: Option<PathBuf>,
     db_path: Option<PathBuf>,
+    user: Option<String>,
+    password: Option<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -937,6 +951,8 @@ fn parse_args() -> CliArgs {
     let mut input = None;
     let mut export_path = None;
     let mut db_path = None;
+    let mut user = None;
+    let mut password = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -958,8 +974,26 @@ fn parse_args() -> CliArgs {
                     std::process::exit(1);
                 }
             }
+            "--user" => {
+                i += 1;
+                if i < args.len() {
+                    user = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --user requires a username");
+                    std::process::exit(1);
+                }
+            }
+            "--password" => {
+                i += 1;
+                if i < args.len() {
+                    password = Some(args[i].clone());
+                } else {
+                    eprintln!("Error: --password requires a password");
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT] [--db PATH]");
+                eprintln!("Usage: openapi-edit [INPUT] [--export OUTPUT] [--db PATH] [--user USER --password PASSWORD]");
                 eprintln!();
                 eprintln!("  INPUT   Path or URL to an OpenAPI spec (YAML/JSON)");
                 eprintln!("  --export OUTPUT");
@@ -969,6 +1003,10 @@ fn parse_args() -> CliArgs {
                 eprintln!("  --db PATH");
                 eprintln!("          Use a custom path for the selections database file.");
                 eprintln!("          Defaults to the platform config directory.");
+                eprintln!("  --user USER");
+                eprintln!("          Username for HTTP Basic Authentication (URL sources only).");
+                eprintln!("  --password PASSWORD");
+                eprintln!("          Password for HTTP Basic Authentication (URL sources only).");
                 std::process::exit(0);
             }
             other => {
@@ -981,6 +1019,8 @@ fn parse_args() -> CliArgs {
         input,
         export_path,
         db_path,
+        user,
+        password,
     }
 }
 
@@ -990,7 +1030,11 @@ fn main() -> eframe::Result {
     // Resolve input source
     let initial_source: Option<InitialSource> = match cli.input.as_deref() {
         Some(s) if s.starts_with("http://") || s.starts_with("https://") => {
-            match download_spec(s) {
+            let basic_auth = cli
+                .user
+                .as_deref()
+                .zip(cli.password.as_deref());
+            match download_spec(s, basic_auth) {
                 Ok((contents, name, format)) => Some(InitialSource::Downloaded {
                     contents,
                     name,

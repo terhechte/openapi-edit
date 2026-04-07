@@ -11,3 +11,4 @@ serde_yaml = "0.9"
 rfd = "0.15"
 ureq = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = "0.22"

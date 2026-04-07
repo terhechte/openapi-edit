@@ -10,7 +10,7 @@ Built with [egui](https://github.com/emilk/egui) via [eframe](https://github.com
 
 ## Features
 
-- Load OpenAPI specs from local files or URLs
+- Load OpenAPI specs from local files or URLs (with optional HTTP Basic Authentication)
 - Endpoints grouped by first path segment with tri-state checkboxes (all/some/none)
 - Search/filter bar to quickly find endpoints
 - Automatic pruning of unreferenced `#/components/*` entries (schemas, parameters, responses, etc.)
@@ -44,6 +44,9 @@ openapi-edit path/to/spec.yaml
 
 # Open a spec from a URL
 openapi-edit https://petstore3.swagger.io/api/v3/openapi.json
+
+# Open a URL behind Basic Authentication
+openapi-edit https://example.com/api.yaml --user admin --password secret
 ```
 
 Use the GUI to select/deselect endpoints, then click **Export** to save the filtered spec. Your selection is automatically remembered for next time.
@@ -72,11 +75,14 @@ When the spec has changed since the last export, the CLI prints diagnostics:
 ### Options
 
 ```
-openapi-edit [INPUT] [--export OUTPUT] [--db PATH]
+openapi-edit [INPUT] [--export OUTPUT] [--db PATH] [--user USER --password PASSWORD]
 
   INPUT              Path or URL to an OpenAPI spec (YAML/JSON)
   --export OUTPUT    Export filtered spec to OUTPUT without opening the GUI
   --db PATH          Use a custom path for the selections database file
+  --user USER        Username for HTTP Basic Authentication (URL sources only)
+  --password PASSWORD
+                     Password for HTTP Basic Authentication (URL sources only)
   -h, --help         Show help
 ```
 
